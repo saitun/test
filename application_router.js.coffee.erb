@@ -1,0 +1,480 @@
+#= require controllers/contacts_controller
+#= require layouts/app
+
+jQuery(document).ready ($) ->
+
+  class ApplicationRouter extends Backbone.Router
+
+    routes:
+      ''                                                : '_index'
+      'upgrade'                                         : '_upgrade'
+      ':workspaceId'                                    : '_index'
+      ':workspaceId/'                                   : '_index'
+
+
+    # Helper to build in-app URL fragments. Takes a set of arguments like:
+    #   ['projects', 12, 'tasks', 1]
+    # and will give you a string like this:
+    #   /15/projects/12/tasks/1
+    #
+    # Note: this automatically prepends the current workspace for convenience
+    urlFor: (parts...) ->
+      @urlForByWorkspaceId Do.Context.workspace.id, parts...
+
+    # Helper to provide a url for an array of parts that abstracts workspace
+    # TODO:  consider changing urlFor to this and everywhere that calls it
+    urlForByWorkspaceId: (workspaceId, parts...) ->
+      '/' + workspaceId + '/' + parts.join('/')
+
+    # Helper to give you an in-app link to an object of any type. Note the IDs
+    # are ordered in a somewhat weird way to make invocation easier. The
+    # rightmost ID belongs to the parent and the leftmost belongs to the child.
+    #
+    # So if you want a task nested in a project you'd say:
+    #
+    #   Do.router.urlForObject workspaceId, 'task', taskId, goalId, goalType
+    #
+    urlForObject: (workspaceId, type, id1, id2, parentType = 'projects') ->
+      pathPart = (type) ->
+        unless type == 'activity'
+          "#{type}s"
+        else
+          type
+
+      type = type.toLowerCase()
+      # TODO: possible bug here if the type's non-plural version ends with an 's'
+      #       but we don't have anything like that yet
+      if type.charAt(type.length-1) == 's'
+        type = type.slice 0, -1
+
+      parts = []
+      parts = parts.concat [parentType, id2] if id2?
+      parts.push pathPart type
+      parts.push id1 if id1?
+
+      @urlForByWorkspaceId workspaceId, parts...
+
+    # Navigates to an in-app destination. Takes the same arguments as urlFor.
+    navigateTo: (parts...) ->
+      @navigate(@urlFor(parts...), trigger: true)
+
+    # show a spinner with light masque that covers the entire page
+    showGlobalSpinner: ->
+      # masque the pague
+      $('<div class="pageMask white"><%= image_tag("info/spinner.png", alt: "loading...", class: "spinner") %></div>').appendTo('body')
+
+    getUrlBase: ->
+      window.location.protocol + '//' + window.location.host
+
+    # Updates the URL and optionally triggers the route function. An optional
+    # callback is executed right before successful navigation.
+    #
+    # This is slightly different than Backbone's original version so we can stop
+    # navigation for dirty states. Don't do work with UI or data side-effects
+    # before or after calling this as navigation may not have happened. Do the
+    # work in the optional callback. If navigation is cancelled, your callback
+    # will *not* be executed.
+    #
+    # navigate(fragment, [options], [callback])
+    navigate: (fragment, options, callback) ->
+      if _.isFunction(options)
+        callback = options
+
+      @_runWithNavigationHooks =>
+        callback() if callback
+
+        continueNavigate = =>
+          # for ipad app mode, save the url fragment so we can bring back this page on the next visit
+          Do.Storage.set('lastUrl', fragment) if Modernizr.ipadapp
+          # remembering the previous url; only using for closing template dialogue now
+          Backbone.history.prevUrl = Backbone.history.getFragment()
+
+          if @_silentRefresh
+            @showGlobalSpinner()
+
+            if fragment == Backbone.history.getFragment()
+              window.location.reload(true)
+            else
+              window.location.href = @getUrlBase() + '/' + fragment
+          else
+            # CoffeeScript makes it hard to get a reference to super. Lame.
+            Backbone.Router::navigate(fragment, options)
+
+        # TODO: This is not ideal; should probably refactor how we do routing to take
+        # into account workspaces like we do for projects
+        # grab the workspace
+        matchResults = fragment.match(/^\/?(\d+)\//)
+        if matchResults
+          workspaceId = matchResults[1]
+          if parseInt(workspaceId,10) != Do.Context.workspace.id
+            if Do.Context.workspaces.get workspaceId
+              @changeWorkspaceById workspaceId, continueNavigate
+            else
+              # Hack for navigating from a notification for a new workspace that is not yet
+              # in Do.Context.workspaces.  The proper fix is to push the new workspace
+              # into the list.
+              window.location.href = @getUrlBase() + '/' + fragment
+          else
+            continueNavigate()
+        else if _.str.include fragment, 'settings'
+          continueNavigate()
+      , fragment
+
+    # navigate the browser to the login page. it only makes sense to do this if the user has been logged out
+    navigateToLogin: ->
+      @showGlobalSpinner()
+      window.location.href = @getUrlBase() + '/login'
+
+    # If the provided URL differs from the current, then navigate to it,
+    # otherwise refresh the view as required.
+    navigateOrRefresh: (url, target) ->
+      unless Backbone.history.getFragment() == url
+        Do.router.navigate url, trigger: true
+      else if target is true or target?.data('force-refresh')
+        # todo: generalize this logic and move down to controller
+        Do.router.currentController.forceRefresh()
+
+    # Handles changing the ui to a new workspace (without requiring a full page reload)
+    changeWorkspaceById: (id, callback) ->
+      # update the workspace context
+      workspace = Do.Context.workspaces.get(id)
+      Do.Context.workspace = workspace
+
+      @sidebar.setSelectedWorkspace workspace.id
+
+      Do.Utils.setPageTitle Do.Context.workspace.get('name')
+      Do.Utils.nag(workspace)
+      Do.SplashManager.run(@)
+      @setGuestStatus()
+
+      callback() if callback
+
+    # Run navigation hooks without actually navigating. The callback will be
+    # executed if the hooks will allow navigations. The callback should contain
+    # a final navigate call.
+    #
+    # Only use this if you need information from code between navigation hooks
+    # and navigate in order to construct the URL.
+    willNavigate: (callback) ->
+      @_runWithNavigationHooks -> callback()
+
+    # Returns true if there are no navigate hooks that may disable navigation.
+    canFreelyNavigate: ->
+      _.size(@_navigationHooks) == 0 and Do.Utils.getFileUploadCount() == 0
+
+    # Set the prompt message shown when navigating away the entire page when
+    # there are active navigational hooks (via onbeforeunload). Call without
+    # arguments to reset to 'You have unsaved changes.'
+    setNavigationPromptMessage: (message = $t('ui.routing.unsaved')) ->
+      @_navigationPromptMessage = message
+
+    # Set the guest of workspace status for the guest avatar treatments
+    # NOTE:  We can't do this in the Bootstrap serializer as we don't yet
+    # have the current workspace.
+    setGuestStatus: ->
+      Do.Context.user.set guest_of_workspace: Do.Context.workspace.get('guest')
+
+    _runWithNavigationHooks: (callback, fragment) ->
+      callbacks = (hook for own key, hook of @_navigationHooks)
+      callbacks.push =>
+        @clearNavigateHooks()  # Ensures cleanup
+        callback() if callback
+      curry = (fns) -> _.head(fns)((-> curry(_.rest(fns))), fragment)
+      curry(callbacks)
+
+    # Register a hook that's called before a navigation happens. The hook is
+    # passed a single argument, a callback function that should be called if
+    # navigation should continue. If you want to stop navigation, just don't
+    # call the callback.
+    registerNavigateHook: (name, callback) ->
+      @_navigationHooks[name] = callback
+
+    # Unregister a navigation hook. No effect if called with an already
+    # unregistered hook, so please call from all exit points of your view.
+    unregisterNavigateHook: (name) ->
+      delete @_navigationHooks[name]
+
+    # Unregister all navigation hooks.
+    clearNavigateHooks: ->
+      delete @_navigationHooks[name] for own name of @_navigationHooks
+
+    # Retrieve the navigation hook by name.
+    getNavigateHook: (name) ->
+      @_navigationHooks[name]
+
+    _createModels: ->
+      # initialize the data store with empty collections
+      @appModel = new Do.Models.Application
+      @appModel.set
+        header: new Backbone.Model
+        user:   new Backbone.Model Do.Bootstrap.user
+
+    # todo: manage the header and sidebar through their respective regions
+    _createViews: ->
+      # initialize the views
+      v = Do.Views
+
+      alertList = new Do.Models.AlertList()
+      workspaceList = Do.Context.workspaces
+
+      @appModel.header().set
+        alertList:   alertList
+        workspaceList: workspaceList
+
+      @sidebar = new v.Sidebar
+        el: $ '#sidebar'
+        workspaceList: workspaceList
+        model: @appModel.header()
+
+      @header = new v.Header
+        el: $ '#header'
+        model: @appModel.header()
+        user:  Do.Context.user
+        workspace: Do.Context.workspace
+
+    _initWorkspace: ->
+      # parse workspace id from the url, if that's invalid, see if we have one stored
+      id = location.href.replace(/^(.*\/)#/, '').split('/')
+      # Older browser's that can't handle the url routing will have
+      # urls of format /#/[id]/foo, instead of /[id]/foo so id will be the second array element
+      id = if '' == id[0] then id[1] else id[0]
+      if isNaN(id = parseInt(id, 10))
+        id = Do.Context.user.get('default_workspace_id')
+
+      # if neither of those are valid fall back to the user's first workspace
+      w = Do.Context.workspaces.get(id) || Do.Context.workspaces.at(0)
+      w.url = "/workspaces/" + w.id
+      Do.Context.workspace = w
+
+      Do.Utils.setPageTitle()
+
+    # sets some globally accessible models that will be used everywhere
+    _initGlobalContext: ->
+      Do.Context.experimentManager = new Do.ExperimentManager(Do.Bootstrap.experiments)
+      delete Do.Bootstrap.experiments
+      Do.Context.user = user = new Do.Models.CurrentUser(Do.Bootstrap.user)
+      Do.Context.workspaces = new Do.Models.WorkspaceList Do.Bootstrap.user.workspaces
+      @_initWorkspace()
+      Do.Context.plans = new Do.Models.PlanList Do.Bootstrap.plans
+      Do.Context.chatCounter = new Do.Utils.ChatCounter()
+      @setGuestStatus()
+      moment.lang(Do.Context.user.get('locale'))
+      Do.Tracker.workspaceSwitched()
+      Do.Context.appList = new Do.Models.AppList Do.Bootstrap.apps
+
+    _index: ->
+      if @_redirectHash  # Redirect after login?
+        @navigate Backbone.history.getFragment(@_redirectHash), trigger: true
+      else               # Personal task list
+        @navigateTo 'tasks'
+
+    _upgrade: ->
+       @navigateTo 'subscriptions'
+
+    setTitleCounter: Do.Utils.updatePageTitleCounter
+
+    handleWorkspaceSwitch: ->
+      Do.Tracker.workspaceSwitched()
+      Do.appLayout.content.remove()
+
+    # tell the app to do a hard refresh next time it does a navigation
+    silentAppRefresh: ->
+      @_silentRefresh = true
+
+    _updateWorkspace: (message) ->
+      # TODO: Use the `update` method after we upgrade to Backbone 0.9.9
+      if workspace = Do.Context.workspaces.get(message.payload.id)
+        workspace.set message.payload
+      else
+        urlRoot = "/workspaces"
+        workspace = new Do.Models.Workspace message.payload
+        workspace.url = "#{urlRoot}/#{workspace.id}"
+        workspace.urlRoot = urlRoot
+        Do.Context.workspaces.add workspace
+
+      Do.Context.workspace = workspace if Do.Context.workspace.id == workspace.id
+
+    initialize: (opts) ->
+      @_initGlobalContext()
+
+      Do.push.initialize()
+      Do.connection.initialize()
+
+      Do.Context.user.syncTimeZone()
+
+      # Navigational hooks. Views can add hooks to prevent or confirm navigation.
+      @_navigationHooks = {}
+
+      # Reset prompt message shown when navigating away entire page when there
+      # are active navigational hooks (via onbeforeunload).
+      @setNavigationPromptMessage()
+
+      # Bind old routes for a bit of backwards compatibility with previously
+      # emailed links, bookmarks, etc.
+      # TODO: Remove once we launch
+      @route /!\/(.*)/, 'old_routes', (fragment) =>
+        @navigate "/#{fragment}", trigger: true
+
+      @_createModels()
+      @_createViews()
+
+      unless Do.Utils.isBilling()
+        Do.SplashManager.run(@)
+
+      # the signin page stored the user's intended destination in a cookie. save that info and delete the cookie
+      if @_redirectHash = $.cookie('redirect_to_hash')
+        $.cookie('redirect_to_hash', null)
+
+      # sidebar and header always render the same thing one time so do it here
+      @header.render()
+
+      # set up an ajax handler that checks the current app version against what the page was loaded with
+      Do.Utils.initAjaxFilters(=> @header.stopNotificationPoller())
+
+      Do.vent.trigger 'app:initialize'
+
+      Do.push.bind 'workspaces', @_updateWorkspace
+
+  Do.appLayout = new Do.Layouts.App().render()
+
+  Do.router = new ApplicationRouter()
+
+  Do.routers =
+    tasks: new Do.Router
+      controller: Do.Controllers.TasksController
+      routes:
+        ':workspaceId/tasks' :    'list'
+        ':workspaceId/tasks/:id': 'detail'
+    notes: new Do.Router
+      controller: Do.Controllers.NotesController
+      routes:
+        # todo: move workspaceId out of routes definations
+        ':workspaceId/notes' :    'list'
+        ':workspaceId/notes/:id': 'detail'
+    contacts: new Do.Router
+      controller: Do.Controllers.ContactsController
+      routes:
+        ':workspaceId/contacts/sync'            :    'sync'
+        ':workspaceId/contacts/sync/:provider'  :    'import'
+        ':workspaceId/contacts'                 :    'list'
+        ':workspaceId/contacts/:id'             :    'activity'
+        ':workspaceId/contacts/:id/activity'    :    'activity'
+        ':workspaceId/contacts/:id/activity/:id':    'activity'
+        ':workspaceId/contacts/:id/about'       :    'about'
+        ':workspaceId/contacts/:id/attachments' :    'attachments'
+        ':workspaceId/contacts/groups/:id'      :    'listByGroup'
+    subscriptions: new Do.Router
+      controller: Do.Controllers.SubscriptionsController
+      routes:
+        ':workspaceId/subscriptions'                      : 'index'
+        ':workspaceId/subscriptions/new/:planId'          : 'new'
+        ':workspaceId/subscriptions/new/:planId/annual'   : 'newAnnual'
+        ':workspaceId/subscriptions/change/:planId'       : 'change'
+        ':workspaceId/subscriptions/cancel/:planId'       : 'cancel'
+        ':workspaceId/subscriptions/billing/:planId'      : 'billing'
+    deals: new Do.Router
+      controller: Do.Controllers.DealsController
+      routes:
+        ':workspaceId/deals'                  :    'list'
+        ':workspaceId/deals/:id'              :    'tasks'
+        ':workspaceId/deals/:id/tasks'        :    'tasks'
+        ':workspaceId/deals/:id/tasks/:id'    :    'tasks'
+        ':workspaceId/deals/:id/activity'     :    'activity'
+        ':workspaceId/deals/:id/activity/:id' :    'activity'
+        ':workspaceId/deals/:id/attachments'  :    'attachments'
+        ':workspaceId/deals/:id/about'        :    'about'
+        ':workspaceId/deals/:id/wufoo'        :    'wufoo'
+    projects: new Do.Router
+      controller: Do.Controllers.ProjectsController
+      routes:
+        ':workspaceId/projects'                  :    'list'
+        ':workspaceId/projects/:id'              :    'tasks'
+        ':workspaceId/projects/:id/tasks'        :    'tasks'
+        ':workspaceId/projects/:id/tasks/:id'    :    'tasks'
+        ':workspaceId/projects/:id/activity'     :    'activity'
+        ':workspaceId/projects/:id/activity/:id' :    'activity'
+        ':workspaceId/projects/:id/attachments'  :    'attachments'
+        ':workspaceId/projects/:id/about'        :    'about'
+        ':workspaceId/projects/:id/wufoo'        :    'wufoo'
+    templates: new Do.Router
+      controller: Do.Controllers.TemplatesController
+      routes:
+        ':workspaceId/templates'                :    'list'
+        ':workspaceId/templates/:id'            :    'tasks'
+        ':workspaceId/templates/:id/tasks'      :    'tasks'
+        ':workspaceId/templates/:id/tasks/:id'  :    'tasks'
+        ':workspaceId/templates/:id/about'      :    'about'
+        ':workspaceId/templates/:id/preview'    :    'preview'
+    maps: new Do.Router
+      controller: Do.Controllers.MapsController
+      routes:
+        ':workspaceId/maps/tasks/:filter'        :    'tasks'
+    chats: new Do.Router
+      controller: Do.Controllers.ChatsController
+      routes:
+        ':workspaceId/chats' :    'rooms'
+        ':workspaceId/chats/:id': 'chats'
+    settings: new Do.Router
+      controller: Do.Controllers.SettingsController
+      routes:
+        'settings'                                : 'showSettings'
+        'settings/:type'                          : 'showSettings'
+        'settings/group/:id'                      : 'showGroupSettings'
+        'settings/group/:id/:group_setting_type'  : 'showGroupSettings'
+        'settings/group/:id/app/:app_type'        : 'showAppSettings'
+
+  # TODO: feels like this is the wrong place, but the sidebar needs to be
+  # rendered before history starts or we get errors when setting the selected
+  # resource.
+  Do.router.sidebar.render()
+
+  # initialize the controller and history
+  Backbone.history.start pushState: true
+
+  # check for webkitNotification support and status
+  Do.Utils.checkWebkitNotifications()
+
+  # check browser compat
+  Do.Utils.checkBrowser()
+
+  # start global tab key listener
+  Do.Utils.initTabHandler()
+
+  # start global hotkey listener
+  Do.hotkeys.initialize() if Do.Flags.check('hotkeys')
+
+  # update timestamp values in the UI periodically
+  Do.Utils.initTimestampUpdater()
+
+  # check geo if applicable
+  if Do.Flags.check('geo_awareness')
+    navigator.geolocation.getCurrentPosition(Do.Utils.setGeo, Do.Utils.handleGeoError)
+
+  # start up the idle handlers
+  Do.idle.init()
+
+  # start up presence pinger
+  Do.presence.start()
+
+  Do.Utils.startGeneratingFileDragEvents()
+
+  _.defer -> Do.Utils.nag(Do.Context.workspace)
+
+  # Route all in-app links. For simplicity, templates can put the destination in
+  # the A tag's href and just set data-relative="true". No event handling is
+  # necessary in the corresponding View.
+  $('a[data-relative]').live 'click', (event) ->
+    event.preventDefault()
+    target = $(event.currentTarget)
+    if !target.data('disabled')
+      url = Backbone.history.getFragment(target.attr('href'))
+
+      Do.router.navigateOrRefresh(url, target)
+
+  # Clicks bubbling up to the top should hide the user menu
+  $('html').bind 'click', ->
+    $('.dropdown.open').removeClass 'open'
+
+  # Prevent full page navigate if there are active navigational hooks
+  window.onbeforeunload = (event) ->
+    Do.router._navigationPromptMessage unless Do.router.canFreelyNavigate()
