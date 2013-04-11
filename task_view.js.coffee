@@ -1,11 +1,14 @@
 class Do.Views.TaskList extends Backbone.View
 
+  events:
+    'click button': 'createTask'
+
   initialize: (opts) ->
     @collection.bind 'add', @addRow
     @collection.bind 'remove', @removeRow
 
   render: ->
-    _.each @collection.models, (model) =>
+    _.each @collection.models, (model) ->
       @addRow(model, collection: @collection)
 
     if @_type == 'project'
@@ -19,6 +22,9 @@ class Do.Views.TaskList extends Backbone.View
       model: model
       collection: collection
     $(@el).append row.render()
+
+  createTask: ->
+    @collection.add new Do.Models.Task()
 
   remove: ->
     @collection.unbind 'add', @addRow
